@@ -3,6 +3,8 @@ Based on the Taobao dataset, the SIM model trained by pointwise is reproduced, m
 
 # Training
 1.First, get the Taobao dataset(https://tianchi.aliyun.com/dataset/649) and sample a certain interaction as a csv file (you can also use the entire dataset)
+
 2.Run cutcsv.py and then data_split.py on your data to get a dictionary of user behavior sequences, as well as a test and training set
+
 3.Modify the parameters and run the train.py
 
