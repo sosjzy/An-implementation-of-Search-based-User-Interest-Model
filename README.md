@@ -8,5 +8,5 @@ Based on the Taobao dataset, the SIM model trained by pointwise is reproduced. M
 
 3.Modify the parameters and run the train.py.
 
-#Link to the paper
+# Link to the paper
 https://arxiv.org/abs/2006.05639
