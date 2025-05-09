@@ -1,19 +1,18 @@
 import csv
 import random
-from collections import defaultdict
 from typing import Dict
 from torch.utils.data import Dataset
+from collections import defaultdict
 
-class UserItemInteractionDataset(Dataset):
+
+class ItemInteractionDataset(Dataset):
     """
-    用户-商品交互数据集(无标题CSV版本)
+    物品-用户交互数据集(无标题CSV版本)
     列顺序: 用户ID,商品ID,商品类目ID,行为类型,时间戳
     """
     
     def __init__(self, csv_path: str):
-        # 存储用户最后一次交互(完整记录)
-        self.user_last_interactions = {}
-        # 存储所有商品记录(用于负采样)
+        # 存储所有商品交互记录
         self.all_item_records = []
         # 按商品ID索引的记录
         self.item_records_dict = defaultdict(list)
@@ -32,15 +31,15 @@ class UserItemInteractionDataset(Dataset):
                     max_item_id = item_id
                 if category_id > max_category_id:
                     max_category_id = category_id
-        
-        # 第二次遍历：进行归一化处理
+        print(max_category_id)
+        # 第二次遍历：进行归一化处理并存储数据
         with open(csv_path, 'r') as f:
             reader = csv.reader(f)
             for row in reader:
                 record = {
                     'user_id': int(row[0]),
-                    'item_id': float(row[1]) / max_item_id,  # 使用item_id的最大值归一化
-                    'category_id': float(row[2]) / max_category_id,  # 使用category_id的最大值归一化
+                    'item_id': float(row[1]),  # 使用 item_id 的最大值归一化
+                    'category_id': float(row[2]),  # 使用 category_id 的最大值归一化
                     'behavior_type': row[3],
                     'timestamp': int(row[4])
                 }
@@ -48,22 +47,13 @@ class UserItemInteractionDataset(Dataset):
                 # 存储所有商品记录(用于负采样)
                 self.all_item_records.append(record)
                 self.item_records_dict[record['item_id']].append(record)
-                
-                # 更新用户最后一次交互
-                user_id = record['user_id']
-                if (user_id not in self.user_last_interactions or 
-                    record['timestamp'] > self.user_last_interactions[user_id]['timestamp']):
-                    self.user_last_interactions[user_id] = record
         
-        # 转换为用户ID列表便于索引
-        self.user_ids = list(self.user_last_interactions.keys())
-    
     def __len__(self) -> int:
-        return len(self.user_ids)
+        return len(self.all_item_records)
     
     def __getitem__(self, idx: int) -> Dict:
-        user_id = self.user_ids[idx]
-        pos_sample = self.user_last_interactions[user_id]
+        # 随机选择一条记录作为正样本
+        pos_sample = random.choice(self.all_item_records)
         
         # 从全体商品中随机选择一个负样本
         neg_record = random.choice(self.all_item_records)
@@ -77,7 +67,7 @@ class UserItemInteractionDataset(Dataset):
         }
 
         return {
-            'user_id': user_id,
+            'user_id': pos_sample['user_id'],
             'positive_sample': pos_sample,
             'negative_sample': neg_sample
         }

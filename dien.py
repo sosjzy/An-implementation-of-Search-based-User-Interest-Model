@@ -50,6 +50,9 @@ class ShortTermInterestExtractor(nn.Module):
                 pos_query: torch.Tensor,
                 lengths: torch.Tensor) -> torch.Tensor:
         # x: (B, H, D), pos_query: (B, D), lengths: (B,)
+        # print(x.shape)
+        # print(pos_query.shape)
+        # print(lengths.shape)
         B, H, D = x.size()
         # 1. pack & GRU
         packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)

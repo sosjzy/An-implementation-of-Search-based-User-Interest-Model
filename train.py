@@ -14,8 +14,9 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
 
-from database import UserItemInteractionDataset
+from database import ItemInteractionDataset
 from model import SimpleRecommendationModel
+import torch.nn.functional as F  # Add this line
 
 
 
@@ -88,20 +89,10 @@ def test_once_realistic(
     userdata: dict,
     model: nn.Module,
     device: torch.device,
-    neg_k: int = 1,
     batch_size: int = 64
 ) -> Tuple[float, float]:
-    # 1) 读取所有正样本，构建全量 item 列表 & item->category 映射
-    pos_df = pd.read_csv(
-        test_csv,
-        header=None,
-        names=['user_id','item_id','category_id','action','timestamp']
-    )
-    all_items = pos_df['item_id'].unique().tolist()
-    item2cat = dict(zip(pos_df['item_id'], pos_df['category_id']))
-
-    # 2) 保持原 Dataset 只产正样本
-    ds = UserItemInteractionDataset(test_csv)
+    # 1) 保持原 Dataset 只产正样本
+    ds = ItemInteractionDataset(test_csv)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
 
     criterion = nn.CrossEntropyLoss()
@@ -113,22 +104,23 @@ def test_once_realistic(
 
     with torch.no_grad():
         for batch in loader:
-            user_ids  = batch['user_id'].tolist()
-            pos       = batch['positive_sample']
+            user_ids = batch['user_id'].tolist()
+            pos = batch['positive_sample']
             pos_items = pos['item_id'].tolist()
-            pos_cats  = pos['category_id'].tolist()
+            pos_cats = pos['category_id'].tolist()
             pos_times = pos['timestamp'].tolist()
             B = len(user_ids)
 
-            # 负样本采样
+            # 负样本采样：从数据集中随机选择负样本
             neg_items_batch = []
-            neg_cats_batch  = []
-            for uid, pc in zip(user_ids, pos_cats):
-                hist_items = {int(r[1]) for r in userdata[int(uid)]}
-                candidates = list(set(all_items) - hist_items)
-                sampled = random.sample(candidates, neg_k)
-                neg_items_batch.append(sampled)
-                neg_cats_batch.append([item2cat[i] for i in sampled])
+            neg_cats_batch = []
+            
+            # 生成负样本，按批次大小生成
+            for _ in range(B):
+                # 对每个批次，随机选择负样本
+                neg_sample = random.choice(ds.all_item_records)  # 从数据集中随机选择一个记录作为负样本
+                neg_items_batch.append(neg_sample['item_id'])
+                neg_cats_batch.append(neg_sample['category_id'])
 
             # 构造 feature tensors
             pos_feat = torch.tensor(
@@ -136,7 +128,7 @@ def test_once_realistic(
                 dtype=torch.float, device=device
             )
             neg_feat = torch.tensor(
-                np.stack([sum(neg_items_batch, []), sum(neg_cats_batch, [])], axis=1),
+                np.stack([neg_items_batch, neg_cats_batch], axis=1),
                 dtype=torch.float, device=device
             )
 
@@ -154,22 +146,24 @@ def test_once_realistic(
             # 正样本 label=1，负样本 label=0
             labels = torch.cat([
                 torch.ones(B, dtype=torch.long, device=device),
-                torch.zeros(B*neg_k, dtype=torch.long, device=device)
+                torch.zeros(B, dtype=torch.long, device=device)
             ], dim=0)
 
             loss = criterion(logits, labels)
-            total_loss += loss.item() * (B*(1+neg_k))
+            total_loss += loss.item() * (B * 2)  # 每个批次包含正负样本，乘以2
 
-            probs = torch.softmax(logits, dim=1)[:,1].cpu().numpy()
+            probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+            
             all_probs.append(probs)
             all_labels.append(labels.cpu().numpy())
 
     all_labels = np.concatenate(all_labels)
-    all_probs  = np.concatenate(all_probs)
-    avg_loss = total_loss / (len(ds) * (1 + neg_k))
-    auc      = roc_auc_score(all_labels, all_probs)
+    all_probs = np.concatenate(all_probs)
+    avg_loss = total_loss / (len(ds) * 2)  # 每个样本有正负两个
+    auc = roc_auc_score(all_labels, all_probs)
 
     return avg_loss, auc
+
 
 
 class Trainer:
@@ -187,6 +181,18 @@ class Trainer:
         self.userdata = userdata
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
+    def contrastive_loss(self, pos_logits, neg_logits, margin=0.5):
+        """
+        计算对比损失，确保正样本远离负样本，负样本远离正样本
+        """
+        pos_prob = F.softmax(pos_logits, dim=1)[:, 1]  # 计算正样本的概率
+        neg_prob = F.softmax(neg_logits, dim=1)[:, 1]  # 计算负样本的概率
+
+        # 对比损失: 我们想让正样本的概率接近1，负样本的概率接近0
+        # 正样本应该尽可能接近正类，负样本应该尽可能接近负类
+        loss = torch.mean((1 - pos_prob) ** 2 + neg_prob ** 2)  # 对比损失
+
+        return loss
 
     def train_epoch(self, epoch_idx: int) -> Tuple[float, float]:
         self.model.train()
@@ -245,26 +251,43 @@ class Trainer:
                 shorttime, st_lens,
                 longtime, lt_lens
             )
-            logits = torch.cat([pos_logits, neg_logits], dim=0)
-            labels = torch.cat([
-                torch.zeros(B, dtype=torch.long, device=self.device),
-                torch.ones(B, dtype=torch.long, device=self.device)
-            ], dim=0)
+            # 正负样本标签
+            pos_labels = torch.ones(B, dtype=torch.long, device=self.device)  # 正样本标签
+            neg_labels = torch.zeros(B, dtype=torch.long, device=self.device)  # 负样本标签
 
-            loss = self.criterion(logits, labels)
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
-            self.optimizer.step()
+            # 计算正负样本的损失
+            # print(pos_logits)
+            
+            pos_loss = self.criterion(pos_logits, pos_labels)
+            # print(pos_loss)
+            neg_loss = self.criterion(neg_logits, neg_labels)
 
+            # 对比损失
+            contrastive_loss = self.contrastive_loss(pos_logits, neg_logits)
+
+            # 总损失：对比损失 + 正负样本损失
+            loss = (pos_loss + neg_loss) / 2 + contrastive_loss
+
+            # 优化步骤
+            self.optimizer.zero_grad()  # 清空梯度
+            loss.backward()  # 反向传播
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)  # 梯度裁剪
+            self.optimizer.step()  # 更新参数
+
+            # 累加总损失
             total_loss += loss.item() * (2 * B)
 
-            probs = torch.softmax(logits, dim=1)[:,1].detach().cpu().numpy()
-            all_probs.append(probs)
-            all_labels.append(labels.cpu().numpy())
+            # 计算预测概率
+            logits = torch.cat([pos_logits, neg_logits], dim=0)
+            probs = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()  # 取正类概率
 
-            pos_p = torch.softmax(pos_logits, dim=1)[:,0].mean().item()
-            neg_p = torch.softmax(neg_logits, dim=1)[:,1].mean().item()
+            # 将概率和标签记录下来
+            all_probs.append(probs)
+            all_labels.append(torch.cat([pos_labels, neg_labels], dim=0).cpu().numpy())
+
+            # 计算正负样本的平均预测概率
+            pos_p = torch.softmax(pos_logits, dim=1)[:, 1].mean().item()  # 正样本属于类 0 的平均概率
+            neg_p = torch.softmax(neg_logits, dim=1)[:, 0].mean().item()  # 负样本属于类 1 的平均概率
             pbar.set_postfix({
                 'loss': f"{loss.item():.4f}",
                 'pos_p': f"{pos_p:.4f}",
@@ -289,7 +312,7 @@ def main():
         'num_epochs':      5,
         'lr':              1e-3,
         'decay_gamma':     0.5,
-        'embedding_dim':   4,
+        'embedding_dim':   16,
         'device':          torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'),
         'model_save_path': 'best_model.pth',
     }
@@ -298,8 +321,10 @@ def main():
 
     with open(cfg['userdata_path'], 'rb') as f:
         userdata = pickle.load(f)
-
-    dataset = UserItemInteractionDataset(cfg['data_path'])
+    # df = pd.read_csv(cfg['data_path'], header=None)
+    # print(f"数据的列数：{df.shape[0]}")
+    dataset = ItemInteractionDataset(cfg['data_path'])
+    print(f"数据集样本数量：{len(dataset)}")
     loader  = DataLoader(
         dataset,
         batch_size=cfg['batch_size'],
@@ -323,7 +348,7 @@ def main():
         elapsed = time.time() - start
         lr = trainer.optimizer.param_groups[0]['lr']
 
-        print(f"\nEpoch {epoch:2d} | lr={lr:.5f} | "
+        print(f"\nEpoch {epoch:2d} | lr={2*lr:.5f} | "
               f"train_loss={train_loss:.4f} | train_auc={train_auc:.4f} | "
               f"time={elapsed:.2f}s")
 
@@ -332,7 +357,6 @@ def main():
             userdata,
             model,
             cfg['device'],
-            neg_k=1,
             batch_size=cfg['batch_size']
         )
         print(f"Epoch {epoch:2d} | test_loss={test_loss:.4f} | test_auc={test_auc:.4f}\n")
